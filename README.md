@@ -143,15 +143,17 @@ Without a config file everything runs on the defaults (Claude Code CLI, `fable` 
 
 ```toml
 # backend = "claude"   # "claude" | "ollama" | "openai" (default: claude)
-# timeout_secs = 90    # per-call deadline; unset → claude 600 / ollama 90 / openai 90
+# timeout_secs = 90    # deadline; on claude it covers the whole model chain, not each attempt; unset → claude 600 / ollama 90 / openai 90
 
 [claude]               # applies when backend = "claude"; values shown are the defaults
 bin = "claude"         # resolved on PATH, then ~/.local/bin, /usr/local/bin
 model = "fable"        # CLI model alias; empty = the CLI's own configured default model
                        # (then the CLI's default must not equal fallback_model — the CLI
                        # rejects that pair)
-fallback_model = "opus"  # passed to the CLI as --fallback-model (its native model-failure
-                       # fallback; comma-separated list allowed). empty = off
+fallback_model = "opus"  # model-failure fallback, comma-separated list; two layers: the CLI's
+                       # native --fallback-model (primary overloaded/unavailable) and the
+                       # consultant's own retry (primary fails outright — e.g. usage limits,
+                       # which the CLI's layer ignores). empty = off
 
 [ollama]               # applies when backend = "ollama"
 url = "http://localhost:11434/v1/chat/completions"
@@ -168,7 +170,8 @@ max_tokens = 8192      # bump to 16–32k for thinking models
                        # regardless of the advisor backend; bin/fallback_model inherit [claude]
 model = "opus"         # the reviewer's own default (the strongest second opinion) — does
                        # NOT follow [claude].model
-fallback_model = "opus"  # optional; default = [claude].fallback_model (inert while it
+fallback_model = "opus"  # optional; default = [claude].fallback_model; retried by the
+                       # consultant when the reviewer's model fails outright (inert while it
                        # equals the model — the CLI rejects a same-model fallback)
 tools = "Read,Grep,Glob"  # whitelist-validated at load (read-only enforced)
 add_dirs = []          # extra --add-dir entries; the workspace (server cwd) is always readable
@@ -177,7 +180,7 @@ timeout_secs = 600     # agentic reviews are slower; the deadline kill is the on
 
 ### Backends
 
-- **claude** (default) — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 600s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) and the injected auth/routing family (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ZCODE_BASE_URL`) are scrubbed from the child — a parent (e.g. ZCode) injecting its own provider credentials must not send a foreign key to the default endpoint. Auth therefore rides the CLI's own login: the stored login from an interactive `claude` session (`/login` inside the session), with `CLAUDE_CODE_OAUTH_TOKEN` the one auth variable still inherited (it is the CLI's own login token, but any parent that sets it authenticates the advisor as that parent's account). Other auth paths are out: an `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`-based setup is scrubbed as above, and settings-file auth such as `apiKeyHelper` doesn't load (`--setting-sources ""` — on Windows + npm installs that empty value can be dropped and user settings may load, see known limitations). Default chain: `fable` primary, `opus` passed as the CLI's native `--fallback-model` — the CLI itself switches models when the primary is overloaded or not available (comma-separated lists are passed through verbatim) and re-tries the primary at the start of each user turn. Error surfacing: terminal API errors land on **stdout** with exit 1, so failure messages lead with a stdout suffix and append stderr; deadline kills drain the pipes briefly and carry the same tails.
+- **claude** (default) — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 600s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) and the injected auth/routing family (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ZCODE_BASE_URL`) are scrubbed from the child — a parent (e.g. ZCode) injecting its own provider credentials must not send a foreign key to the default endpoint. Auth therefore rides the CLI's own login: the stored login from an interactive `claude` session (`/login` inside the session), with `CLAUDE_CODE_OAUTH_TOKEN` the one auth variable still inherited (it is the CLI's own login token, but any parent that sets it authenticates the advisor as that parent's account). Other auth paths are out: an `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`-based setup is scrubbed as above, and settings-file auth such as `apiKeyHelper` doesn't load (`--setting-sources ""` — on Windows + npm installs that empty value can be dropped and user settings may load, see known limitations). Default chain: `fable` primary, `opus` as fallback — two layers: the CLI's native `--fallback-model` (switches when the primary is overloaded or not available) plus the consultant's own retry, which exists because the CLI's layer does **not** fire on usage-limit errors ("You've reached your Fable limit", exit 1): a non-timeout CLI failure advances to the next fallback model as a fresh one-shot call (timeouts are not retried — the deadline was spent, not the quota). Comma-separated lists are tried in order. Error surfacing: terminal API errors land on **stdout** with exit 1, so failure messages lead with a stdout suffix and append stderr; deadline kills drain the pipes briefly and carry the same tails.
 - **ollama** — the local Ollama OpenAI-compatible endpoint over plain HTTP (hand-written client). Needs `ollama login` once and a running `ollama serve`; no API key. `kimi-k3:cloud` is Ollama's cloud-hosted model billed through your Ollama account — `ollama pull` can't fetch it and `/api/tags` doesn't list it.
 - **openai** — any OpenAI-compatible chat-completions endpoint over HTTP(S) via ureq/rustls (bundled webpki roots, no system cert store, no openssl). Sends `Authorization: Bearer <api_key>` and the `max_tokens` wire field (not the newer `max_completion_tokens`) — same scope as the Ollama path.
 

@@ -527,8 +527,9 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
 
 // ask_advisor routes to the configured backend. Shared by the MCP tool and
 // hook mode; any error returns Err and the caller decides the presentation
-// (MCP returns an is_error result, hooks pass through silently). Model
-// failure fallback is the claude CLI's own --fallback-model machinery, so
+// (MCP returns an is_error result, hooks pass through silently). On the
+// claude backend, model failure falls back inside claude.rs (the CLI's
+// native --fallback-model plus our own retry for usage-limit errors), so
 // the callers label output with the configured chain (advisor_label).
 pub fn ask_advisor(question: &str, context_str: &str) -> Result<String, String> {
     let cfg = config::global();

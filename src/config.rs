@@ -39,9 +39,10 @@ pub const CLAUDE_BIN: &str = "claude";
 // model = "" in the config file still means "the CLI's default" (then make
 // sure the CLI's default isn't the fallback model — the CLI rejects that).
 pub const CLAUDE_MODEL: &str = "fable";
-// model fallback: passed to the CLI as its native --fallback-model (comma-
-// separated list allowed; the CLI switches models when the primary is
-// overloaded or not available). Empty = off.
+// model fallback, comma-separated list: passed to the CLI as its native
+// --fallback-model (fires when the primary is overloaded or not available)
+// AND retried by the consultant itself when the primary fails outright
+// (usage-limit errors — the CLI's layer does not fire on those). Empty = off.
 pub const CLAUDE_FALLBACK_MODEL: &str = "opus";
 // The reviewer is the second opinion — quality over cost, so its default is
 // the strongest model, deliberately NOT following [claude].model. Override
@@ -63,8 +64,10 @@ pub enum Backend {
     /// Local Ollama's OpenAI-compatible endpoint (plain HTTP, no auth).
     Ollama { url: String, model: String, max_tokens: u64 },
     /// Claude Code CLI headless mode (`claude -p`), auth via the CLI's login.
-    /// `fallback_model` rides the CLI's native `--fallback-model` flag (the
-    /// CLI falls back when the primary is overloaded/unavailable).
+    /// `fallback_model` is two-layered: the CLI's native `--fallback-model`
+    /// flag (fires when the primary is overloaded/unavailable) plus the
+    /// consultant's own retry (fires when the primary fails outright —
+    /// usage limits, which the CLI's layer ignores).
     Claude { bin: String, model: String, fallback_model: String },
     /// Any OpenAI-compatible chat-completions endpoint over HTTP(S) with a
     /// bearer key. The wire field is `max_tokens` (not the newer

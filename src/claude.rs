@@ -31,7 +31,8 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 // Fixed hygiene flag set shared by every invocation (tests drive `run` with
 // other binaries, so this lives in one place). fallback_model rides the CLI's
 // native --fallback-model (automatic model switch when the primary is
-// overloaded/unavailable); suppressed when empty or equal to the model — the
+// overloaded/unavailable — but NOT when it hits a usage limit; run_chain
+// covers that gap); suppressed when empty or equal to the model — the
 // CLI rejects a fallback equal to the main model.
 fn base_args(model: &str, fallback_model: &str, system_prompt: &str) -> Vec<String> {
     let mut args: Vec<String> = [
@@ -93,14 +94,18 @@ pub fn reviewer_args(
     args
 }
 
-// ask: the advisor call — one subprocess; model-failure fallback rides the
-// CLI's native --fallback-model (comma-separated list, tried in order by the
-// CLI itself; it re-tries the primary on the next user turn — moot in
-// one-shot mode).
+// ask: the advisor call. Model failure falls back on two layers: the CLI's
+// native --fallback-model (fires when the primary is overloaded or not
+// available) and our own retry chain below — which exists because the CLI's
+// layer does NOT fire on usage-limit errors (verified live: "You've reached
+// your Fable limit", exit 1, despite the flag), so a quota-exhausted primary
+// needs a second call with the fallback as the primary.
 pub fn ask(bin: &str, model: &str, fallback_model: &str, system_prompt: &str, prompt: &str, timeout: Duration) -> Result<String, String> {
     let resolved = resolve_bin(bin)?;
-    crate::logger::info(&format!("claude spawn bin={} model={model} fallback={fallback_model}", resolved.display()));
-    run(&resolved, &cli_args(model, fallback_model, system_prompt), prompt, timeout)
+    let bin_display = resolved.display().to_string();
+    run_chain(&bin_display, model, fallback_model, "", "", timeout, |m, fb, t| {
+        run(&resolved, &cli_args(m, fb, system_prompt), prompt, t)
+    })
 }
 
 pub fn ask_review(
@@ -114,12 +119,83 @@ pub fn ask_review(
     timeout: Duration,
 ) -> Result<String, String> {
     let resolved = resolve_bin(bin)?;
-    crate::logger::info(&format!(
-        "claude spawn (review) bin={} model={model} fallback={fallback_model} tools={tools} add_dirs={}",
-        resolved.display(),
-        add_dirs.join(",")
-    ));
-    run(&resolved, &reviewer_args(model, fallback_model, system_prompt, tools, add_dirs), prompt, timeout)
+    let bin_display = resolved.display().to_string();
+    let log_extra = format!(" tools={tools} add_dirs={}", add_dirs.join(","));
+    run_chain(&bin_display, model, fallback_model, "(review) ", &log_extra, timeout, |m, fb, t| {
+        run(&resolved, &reviewer_args(m, fb, system_prompt, tools, add_dirs), prompt, t)
+    })
+}
+
+// model_chain: the retry order — the primary, then every comma-separated
+// fallback entry (trimmed; empty entries, repeats, and entries equal to an
+// earlier model dropped — the CLI rejects a fallback equal to the model).
+fn model_chain(model: &str, fallback_model: &str) -> Vec<String> {
+    let mut chain = vec![model.trim().to_string()];
+    for m in fallback_model.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        if !chain.iter().any(|c| c.as_str() == m) {
+            chain.push(m.to_string());
+        }
+    }
+    chain
+}
+
+// run()'s timeout error is the one failure a model retry cannot help — the
+// deadline was spent, not a model quota, and a retry would double the wall
+// time behind the consult lock. Matched by the prefix run() itself produces.
+fn is_timeout_err(e: &str) -> bool {
+    e.starts_with("claude CLI timed out")
+}
+
+// run_chain: try the chain in order — attempt i runs with model=chain[i] and
+// the remainder as the CLI-native fallback flag (so both layers compose).
+// Any non-timeout failure advances to the next model; the last error is
+// returned verbatim when the chain is exhausted. try_model is the seam that
+// runs one CLI attempt (tests inject fakes; production runs the subprocess).
+fn run_chain<T>(
+    bin_display: &str,
+    model: &str,
+    fallback_model: &str,
+    label: &str,
+    log_extra: &str,
+    timeout: Duration,
+    mut try_model: T,
+) -> Result<String, String>
+where
+    T: FnMut(&str, &str, Duration) -> Result<String, String>,
+{
+    let chain = model_chain(model, fallback_model);
+    // the configured timeout is the whole chain's budget, not a per-attempt
+    // one: each attempt gets the remainder, so a slow non-timeout failure
+    // cannot hold the consult lock for N × timeout
+    let deadline = Instant::now() + timeout;
+    let mut last_err = String::new();
+    for (i, m) in chain.iter().enumerate() {
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            break; // budget spent — no attempt left to try
+        }
+        let fb = chain[i + 1..].join(",");
+        crate::logger::info(&format!(
+            "claude spawn {label}bin={bin_display} model={m} fallback={fb}{log_extra}"
+        ));
+        match try_model(m, &fb, budget) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                if is_timeout_err(&e) {
+                    return Err(e);
+                }
+                if i + 1 < chain.len() {
+                    crate::logger::info(&format!(
+                        "claude fallback model={m} -> {} reason={}",
+                        chain[i + 1],
+                        last_chars(&e, 200)
+                    ));
+                }
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 // run: spawn `bin args...`, feed prompt on stdin, capture stdout/stderr with
@@ -402,6 +478,129 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    // the live limit message (witnessed in consultant.log 2026-09-19/20) —
+    // the CLI's native --fallback-model does NOT fire on it (verified live:
+    // exit 1 despite the flag), which is why run_chain exists
+    const FABLE_LIMIT_ERR: &str = "claude CLI failed (exit code 1): You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
+
+    // calls: what the injected attempt runner saw — (model, fallback) pairs
+    struct Calls(Vec<(String, String)>);
+    impl Calls {
+        fn new() -> Self {
+            Calls(Vec::new())
+        }
+        fn push(&mut self, m: &str, fb: &str) {
+            self.0.push((m.to_string(), fb.to_string()));
+        }
+    }
+
+    #[test]
+    fn run_chain_retries_with_fallback_model_on_quota_error() {
+        // fable hits its limit → the chain advances and opus answers; the
+        // primary attempt still carries the CLI-native fallback flag
+        let mut calls = Calls::new();
+        let out = run_chain("", "fable", "opus", "", "", Duration::from_secs(10), |m, fb, _t| {
+            calls.push(m, fb);
+            match m {
+                "fable" => Err(FABLE_LIMIT_ERR.to_string()),
+                _ => Ok("ADVICE".to_string()),
+            }
+        })
+        .unwrap();
+        assert_eq!(out, "ADVICE");
+        assert_eq!(calls.0, vec![("fable".to_string(), "opus".to_string()), ("opus".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn run_chain_does_not_retry_a_timeout_with_the_fallback_model() {
+        // a deadline kill is not a model failure — retrying would double the
+        // wall time behind the consult lock; exactly one attempt may run
+        let mut calls = Calls::new();
+        let err = run_chain("", "fable", "opus,sonnet", "", "", Duration::from_secs(10), |m, fb, _t| {
+            calls.push(m, fb);
+            Err("claude CLI timed out after 600s (raise timeout_secs in the config file)".to_string())
+        })
+        .unwrap_err();
+        assert!(err.starts_with("claude CLI timed out"), "unexpected error: {err}");
+        assert_eq!(calls.0.len(), 1, "a timeout must not advance the chain: {:?}", calls.0);
+    }
+
+    #[test]
+    fn exhausted_chain_returns_the_last_error() {
+        // every model failed → the LAST model's error surfaces (the primary's
+        // quota message would point the user at the wrong fix)
+        let err = run_chain("", "fable", "opus", "", "", Duration::from_secs(10), |m, _fb, _t| {
+            Err(format!("claude CLI failed (exit code 1): You've reached your {} limit.", if m == "fable" { "Fable" } else { "Opus" }))
+        })
+        .unwrap_err();
+        assert!(err.contains("Opus limit"), "must surface the fallback's error: {err}");
+        assert!(!err.contains("Fable limit"), "stale primary error: {err}");
+        // no fallback configured → the primary's error, unchanged, one attempt
+        let mut calls = Calls::new();
+        let err = run_chain("", "fable", "", "", "", Duration::from_secs(10), |m, fb, _t| {
+            calls.push(m, fb);
+            Err(FABLE_LIMIT_ERR.to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, FABLE_LIMIT_ERR);
+        assert_eq!(calls.0.len(), 1);
+    }
+
+    #[test]
+    fn ask_spawns_the_real_cli_through_the_chain() {
+        // wiring smoke test through the real subprocess path, with system
+        // binaries only (a freshly-written script file would depend on the
+        // OS's first-exec scan of new executables — slow and flaky):
+        // /bin/echo answers on the first attempt
+        let out = ask("/bin/echo", "fable", "opus", "SP", "q", Duration::from_secs(10)).unwrap();
+        assert!(out.contains("--model fable"), "echo replays its args: {out}");
+        // /usr/bin/false fails every attempt → the chain runs out, last error out
+        let err = ask("/usr/bin/false", "fable", "opus", "SP", "q", Duration::from_secs(10)).unwrap_err();
+        assert!(err.contains("exit code 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn model_chain_trims_dedupes_and_drops_primary_equals() {
+        assert_eq!(model_chain("fable", "opus"), s(&["fable", "opus"]));
+        assert_eq!(model_chain("fable", " opUS , sonnet ,,fable, opUS "), s(&["fable", "opUS", "sonnet"]));
+        assert_eq!(model_chain("opus", "opus"), s(&["opus"]));
+        assert_eq!(model_chain("fable", ""), s(&["fable"]));
+        // empty primary = the CLI's default model; a fallback still chains
+        assert_eq!(model_chain("", "opus"), s(&["", "opus"]));
+    }
+
+    #[test]
+    fn timeout_errors_are_classified_by_their_prefix() {
+        assert!(is_timeout_err("claude CLI timed out after 600s (raise timeout_secs in the config file)"));
+        assert!(!is_timeout_err("claude CLI failed (exit code 1): boom"));
+        assert!(!is_timeout_err("claude CLI returned an empty response"));
+        assert!(!is_timeout_err("spawning /bin/x failed: nope"));
+        assert!(!is_timeout_err(""));
+    }
+
+    #[test]
+    fn run_chain_shares_one_deadline_across_attempts() {
+        // the configured timeout is the CHAIN's budget: attempt 2 gets the
+        // remainder, not a fresh deadline (a slow non-timeout failure must
+        // not double the wall time behind the consult lock)
+        let mut seen: Vec<(String, Duration)> = Vec::new();
+        let err = run_chain("", "fable", "opus", "", "", Duration::from_millis(1000), |m, _fb, t| {
+            seen.push((m.to_string(), t));
+            if m == "fable" {
+                std::thread::sleep(Duration::from_millis(300));
+                Err(FABLE_LIMIT_ERR.to_string())
+            } else {
+                Err("claude CLI failed (exit code 1): opus down".to_string())
+            }
+        })
+        .unwrap_err();
+        assert!(err.contains("opus down"), "{err}");
+        assert_eq!(seen.len(), 2, "{:?}", seen);
+        let t2 = seen[1].1;
+        assert!(!t2.is_zero(), "a spent budget must not spawn attempt 2");
+        assert!(t2 <= Duration::from_millis(700), "attempt 2 must get the remaining budget, got {t2:?}");
+    }
+
     #[test]
     fn oversized_stdout_is_truncated_not_killed() {
         // a child writing past STDOUT_CAP must not block on a full pipe and
@@ -456,6 +655,9 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "--allowedTools" && w[1] == "Read"));
         let a = reviewer_args("fable", "opus", "RP", "Read", &[]);
         assert!(a.windows(2).any(|w| w[0] == "--fallback-model" && w[1] == "opus"));
+        // the chain's LAST attempt passes an empty fallback → no dangling flag
+        let a = reviewer_args("opus", "", "RP", "Read", &[]);
+        assert!(!a.contains(&"--fallback-model".to_string()));
     }
 
     #[test]
