@@ -4,3 +4,4 @@ advisor.log*
 hooks-debug.log
 *.bak*
 .zcode/
+targets/
